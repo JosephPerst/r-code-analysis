@@ -1,0 +1,32 @@
+# R specific
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Session files
+*.RDataTmp
+
+# Compiled files
+*.o
+*.so
+*.dll
+
+# Output files
+*.pdf
+*.html
+*.docx
+
+# Data files
+*.csv
+*.xlsx
+data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
