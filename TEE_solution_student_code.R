@@ -343,3 +343,245 @@ cat("\n--- Submission preview (submission_zinb.csv) ---\n")
 print(head(submission_zinb))
 
 cat("\nDone.  Submit submission_zinb.csv as the ZINB entry.\n")
+
+# ============================================================
+# Best-Effort Model: Hurdle XGBoost + ZINB Ensemble
+# ============================================================
+# The ZINB is the right *shape* for this data, but it is linear on
+# the log scale and is forced through a small functional class.  To
+# maximise predictive accuracy we add a more flexible learner and
+# blend it with the ZINB.
+#
+# Architecture:
+#   Stage 1  P(Y > 0 | X)        XGBoost binary classifier
+#   Stage 2  E[Y | X, Y > 0]     XGBoost regression on log1p(Y)
+#                                fit only on Y > 0 rows, with a
+#                                Duan smearing back-transform.
+#   Hurdle pred  = Stage1 * Stage2
+#
+# Feature engineering:
+#   - leave-one-out smoothed player target encoding (the dominant
+#     signal in this data set is player identity; we have ~3 obs
+#     per player on average)
+#   - lag-1 days_missed per player (NA where unobserved -- XGBoost
+#     handles NAs natively via its default-direction split)
+#   - exposure ratios (travel/game, b2b/game)
+#   - total minutes, career age, quadratic age/minutes
+#
+# Honest evaluation: 5-fold CV using the same fold structure for
+# both stages, so the hurdle prediction is fully out-of-fold.  The
+# ZINB ensemble weight is tuned on those OOF predictions.
+#
+# NOTE: injury_occurred is NOT used as a feature anywhere; it is
+# only used to derive the binary label internally from y > 0, which
+# is the *response*, not a predictor.
+# ============================================================
+
+if (!requireNamespace("xgboost", quietly = TRUE)) {
+  install.packages("xgboost")
+}
+library(xgboost)
+
+set.seed(478)
+
+# ------------------------------------------------------------
+# Feature engineering
+# ------------------------------------------------------------
+
+global_mean <- mean(df$days_missed)
+K_SMOOTH    <- 5   # shrinkage strength for player target encoding
+
+player_agg <- df %>%
+  group_by(player_id) %>%
+  summarise(player_n = n(), player_sum = sum(days_missed), .groups = "drop")
+
+# Lag-1 lookup: for a row in season s, find that player's training
+# days_missed in season s - 1 (NA if unobserved).
+lag_lookup <- df %>%
+  transmute(player_id,
+            season_int        = as.integer(as.character(season)) + 1L,
+            lag1_days_missed  = days_missed)
+
+engineer <- function(d, is_train) {
+  d2 <- d %>%
+    left_join(player_agg, by = "player_id") %>%
+    mutate(player_n   = ifelse(is.na(player_n),   0, player_n),
+           player_sum = ifelse(is.na(player_sum), 0, player_sum))
+  if (is_train) {
+    d2 <- d2 %>%
+      mutate(loo_n     = pmax(player_n - 1, 0),
+             loo_sum   = player_sum - days_missed,
+             player_te = (loo_sum + K_SMOOTH * global_mean) /
+                         (loo_n   + K_SMOOTH)) %>%
+      select(-loo_n, -loo_sum)
+  } else {
+    d2 <- d2 %>%
+      mutate(player_te = (player_sum + K_SMOOTH * global_mean) /
+                         (player_n   + K_SMOOTH))
+  }
+  d2 %>%
+    mutate(season_int      = as.integer(as.character(season))) %>%
+    left_join(lag_lookup, by = c("player_id", "season_int")) %>%
+    mutate(career_age      = age - base_age,
+           total_minutes   = minutes_per_game * games_played,
+           travel_per_game = travel_miles / pmax(games_played, 1),
+           b2b_rate        = back_to_back_games / pmax(games_played, 1),
+           age_sq          = age^2,
+           minutes_sq      = minutes_per_game^2)
+}
+
+df_eng   <- engineer(df,       is_train = TRUE)
+test_eng <- engineer(test_df,  is_train = FALSE)
+
+feature_cols <- c("base_age", "minutes_per_game", "games_played",
+                  "travel_miles", "back_to_back_games", "prior_injury_days",
+                  "career_age", "total_minutes", "travel_per_game",
+                  "b2b_rate", "age_sq", "minutes_sq",
+                  "player_te", "player_n", "lag1_days_missed", "season_int")
+
+make_X <- function(d) {
+  X_num <- as.matrix(d[, feature_cols])
+  X_pos <- model.matrix(~ position - 1, data = d)
+  X_tm  <- model.matrix(~ team_id  - 1, data = d)
+  cbind(X_num, X_pos, X_tm)
+}
+
+X_train <- make_X(df_eng)
+X_test  <- make_X(test_eng)
+y_train <- df_eng$days_missed
+y_bin   <- as.integer(y_train > 0)
+
+# ------------------------------------------------------------
+# 5-fold OOF predictions for honest evaluation and ensemble weighting
+# ------------------------------------------------------------
+
+K_FOLDS <- 5
+folds   <- sample(rep(1:K_FOLDS, length.out = nrow(df_eng)))
+
+params_cls <- list(objective = "binary:logistic", eval_metric = "logloss",
+                   max_depth = 4, eta = 0.05,
+                   subsample = 0.8, colsample_bytree = 0.8,
+                   min_child_weight = 5)
+params_reg <- list(objective = "reg:squarederror", eval_metric = "rmse",
+                   max_depth = 4, eta = 0.05,
+                   subsample = 0.8, colsample_bytree = 0.8,
+                   min_child_weight = 5)
+
+oof_p_pos      <- rep(NA_real_, nrow(df_eng))
+oof_mu_pos     <- rep(NA_real_, nrow(df_eng))
+
+cat("\n--- Building 5-fold OOF predictions (hurdle XGBoost) ---\n")
+for (k in 1:K_FOLDS) {
+  tr_idx <- which(folds != k)
+  te_idx <- which(folds == k)
+
+  # Stage 1: binary classifier
+  dtr <- xgb.DMatrix(X_train[tr_idx, ], label = y_bin[tr_idx])
+  dte <- xgb.DMatrix(X_train[te_idx, ], label = y_bin[te_idx])
+  cv1 <- xgb.cv(data = dtr, params = params_cls,
+                nrounds = 2000, nfold = 5,
+                early_stopping_rounds = 40, verbose = 0)
+  m_cls <- xgb.train(data = dtr, params = params_cls,
+                     nrounds = cv1$best_iteration, verbose = 0)
+  oof_p_pos[te_idx] <- predict(m_cls, X_train[te_idx, ])
+
+  # Stage 2: regression on log1p(y) restricted to y > 0 in TRAIN fold
+  pos_tr   <- tr_idx[y_train[tr_idx] > 0]
+  y_log_tr <- log1p(y_train[pos_tr])
+  dtr2 <- xgb.DMatrix(X_train[pos_tr, ], label = y_log_tr)
+  cv2 <- xgb.cv(data = dtr2, params = params_reg,
+                nrounds = 2000, nfold = 5,
+                early_stopping_rounds = 40, verbose = 0)
+  m_reg <- xgb.train(data = dtr2, params = params_reg,
+                     nrounds = cv2$best_iteration, verbose = 0)
+
+  # Duan smearing: pred = mean(exp(resid)) * exp(log_pred) - 1
+  resid_tr   <- y_log_tr - predict(m_reg, X_train[pos_tr, ])
+  smear_k    <- mean(exp(resid_tr))
+  log_pred_te <- predict(m_reg, X_train[te_idx, ])
+  oof_mu_pos[te_idx] <- pmax(smear_k * exp(log_pred_te) - 1, 0)
+
+  cat(sprintf("  fold %d  nrounds: cls=%d reg=%d  smear=%.3f\n",
+              k, cv1$best_iteration, cv2$best_iteration, smear_k))
+}
+
+oof_hurdle <- oof_p_pos * oof_mu_pos
+rmse_hurdle_oof <- sqrt(mean((y_train - oof_hurdle)^2))
+cat("\n5-fold OOF RMSE (Hurdle XGBoost) :", round(rmse_hurdle_oof, 3), "\n")
+
+# OOF ZINB for ensemble weight tuning (refit per fold)
+cat("\n--- Building 5-fold OOF predictions (ZINB) ---\n")
+oof_zinb <- rep(NA_real_, nrow(df_eng))
+zinb_form_final <- make_zinb_formula(zinb_search$count_terms,
+                                     zinb_search$zero_terms)
+for (k in 1:K_FOLDS) {
+  tr <- df[folds != k, ]; te_idx <- which(folds == k)
+  m  <- tryCatch(zeroinfl(zinb_form_final, data = tr, dist = "negbin"),
+                 error = function(e) NULL)
+  if (!is.null(m)) {
+    oof_zinb[te_idx] <- predict(m, newdata = df[te_idx, ], type = "response")
+  } else {
+    oof_zinb[te_idx] <- mean(tr$days_missed)
+  }
+}
+rmse_zinb_oof <- sqrt(mean((y_train - oof_zinb)^2))
+cat("5-fold OOF RMSE (ZINB)           :", round(rmse_zinb_oof, 3), "\n")
+
+# ------------------------------------------------------------
+# Ensemble weight: pred = w * hurdle + (1 - w) * ZINB
+# ------------------------------------------------------------
+
+w_grid <- seq(0, 1, by = 0.01)
+rmse_w <- sapply(w_grid, function(w)
+  sqrt(mean((y_train - (w * oof_hurdle + (1 - w) * oof_zinb))^2)))
+w_star <- w_grid[which.min(rmse_w)]
+rmse_blend_oof <- min(rmse_w)
+cat(sprintf("\nOptimal blend weight (hurdle vs ZINB) : w* = %.2f\n", w_star))
+cat(sprintf("5-fold OOF RMSE (blend)          : %.3f\n", rmse_blend_oof))
+cat(sprintf("Baselines: linear (in-sample) %.3f, ZINB OOF %.3f, hurdle OOF %.3f\n",
+            sqrt(mean(residuals(mod_lm)^2)), rmse_zinb_oof, rmse_hurdle_oof))
+
+# ------------------------------------------------------------
+# Final fit on ALL training data, predict on test
+# ------------------------------------------------------------
+
+# Stage 1 final
+dtrain_cls_full <- xgb.DMatrix(X_train, label = y_bin)
+cv1_full <- xgb.cv(data = dtrain_cls_full, params = params_cls,
+                   nrounds = 2000, nfold = 5,
+                   early_stopping_rounds = 40, verbose = 0)
+mod_cls_full <- xgb.train(data = dtrain_cls_full, params = params_cls,
+                          nrounds = cv1_full$best_iteration, verbose = 0)
+
+# Stage 2 final (positive subset)
+pos_all   <- which(y_train > 0)
+y_log_all <- log1p(y_train[pos_all])
+dtrain_reg_full <- xgb.DMatrix(X_train[pos_all, ], label = y_log_all)
+cv2_full <- xgb.cv(data = dtrain_reg_full, params = params_reg,
+                   nrounds = 2000, nfold = 5,
+                   early_stopping_rounds = 40, verbose = 0)
+mod_reg_full <- xgb.train(data = dtrain_reg_full, params = params_reg,
+                          nrounds = cv2_full$best_iteration, verbose = 0)
+
+smear_full <- mean(exp(y_log_all - predict(mod_reg_full, X_train[pos_all, ])))
+
+p_pos_test    <- predict(mod_cls_full, X_test)
+log_pred_test <- predict(mod_reg_full, X_test)
+mu_test       <- pmax(smear_full * exp(log_pred_test) - 1, 0)
+pred_hurdle   <- p_pos_test * mu_test
+
+# Final blended prediction
+pred_blend <- w_star * pred_hurdle + (1 - w_star) * pred_zinb
+pred_blend <- pmax(pred_blend, 0)
+
+submission_hurdle <- make_submission(pred_hurdle, "submission_hurdle_xgb.csv")
+submission_best   <- make_submission(pred_blend,  "submission_best.csv")
+
+cat("\n--- Final submission previews ---\n")
+cat("Hurdle XGBoost (submission_hurdle_xgb.csv):\n")
+print(head(submission_hurdle))
+cat("\nBlend XGB + ZINB (submission_best.csv):\n")
+print(head(submission_best))
+
+cat("\nBest model:  submission_best.csv\n")
+cat(sprintf("(OOF RMSE blend = %.3f, w* = %.2f)\n", rmse_blend_oof, w_star))
