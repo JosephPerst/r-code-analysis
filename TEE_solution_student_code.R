@@ -327,44 +327,19 @@ cat("5-fold CV RMSE (ZINB final)  :",
 # Step 5: predictions on the Kaggle test set
 # ------------------------------------------------------------
 #
-# Two predictions are produced:
-#
-#  (A) submission_zinb.csv -- the unconditional ZINB mean
-#         E[Y | X] = (1 - pi(X)) * mu(X)
-#      This is the prediction the model would make if we did not
-#      know injury_occurred at test time.
-#
-#  (B) submission_zinb_conditional.csv -- since the test file does
-#      ship injury_occurred, the statistically optimal point predictor
-#      under squared-error loss is
-#         E[Y | X, injury_occurred = 1] = mu(X) / (1 - P_NB(0 ; mu, theta))
-#         E[Y | X, injury_occurred = 0] = 0
-#      i.e. the zero-truncated NB mean times the indicator.  This
-#      uses information genuinely in the test set and is therefore
-#      a legitimate -- not "leaky" -- improvement.
-#
-# Both files are written so the choice is transparent and reviewable.
+# Per the assignment rule that injury_occurred is NOT to be used,
+# we generate a single prediction file: the unconditional ZINB mean
+#     E[Y | X] = (1 - pi(X)) * mu(X)
+# where pi(X) is the structural-zero probability from the logit
+# component and mu(X) is the mean of the NB count component.
 
-mu_hat <- predict(mod_zinb_final, newdata = test_df, type = "count")  # mu(X)
-p_zero <- predict(mod_zinb_final, newdata = test_df, type = "zero")   # pi(X)
-pred_zinb <- (1 - p_zero) * mu_hat                                    # E[Y]
+mu_hat    <- predict(mod_zinb_final, newdata = test_df, type = "count")  # mu(X)
+p_zero    <- predict(mod_zinb_final, newdata = test_df, type = "zero")   # pi(X)
+pred_zinb <- (1 - p_zero) * mu_hat                                       # E[Y]
 
-theta_hat <- mod_zinb_final$theta
-# P_NB(Y = 0 ; mu, theta) = (theta / (theta + mu))^theta
-p_nb_zero <- (theta_hat / (theta_hat + mu_hat))^theta_hat
-pred_zinb_cond <- ifelse(test_df$injury_occurred == 1,
-                         mu_hat / (1 - p_nb_zero),
-                         0)
+submission_zinb <- make_submission(pred_zinb, "submission_zinb.csv")
 
-submission_zinb       <- make_submission(pred_zinb,      "submission_zinb.csv")
-submission_zinb_cond  <- make_submission(pred_zinb_cond, "submission_zinb_conditional.csv")
-
-cat("\n--- Submission previews ---\n")
-cat("Unconditional ZINB (submission_zinb.csv):\n")
+cat("\n--- Submission preview (submission_zinb.csv) ---\n")
 print(head(submission_zinb))
-cat("\nConditional on injury_occurred (submission_zinb_conditional.csv):\n")
-print(head(submission_zinb_cond))
 
-cat("\nDone.  Submit submission_zinb.csv as the principled ZINB entry;\n")
-cat("submit submission_zinb_conditional.csv to additionally exploit the\n")
-cat("injury_occurred indicator that ships with the Kaggle test file.\n")
+cat("\nDone.  Submit submission_zinb.csv as the ZINB entry.\n")
